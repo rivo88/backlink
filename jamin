@@ -1,0 +1,6 @@
+<?php
+// Redirect 301 permanen
+header("HTTP/1.1 301 Moved Permanently");
+header("Location: https://campus.fahce.unlp.edu.ar/");
+exit();
+?>
